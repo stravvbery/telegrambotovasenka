@@ -17,6 +17,7 @@ GEMINI_API_URL = (
 )
 TIMEOUT_SECONDS = 60
 RATE_LIMIT_COOLDOWN = 60.0
+ERROR_COOLDOWN = 300.0
 RECHECK_INTERVAL = 30.0
 
 
@@ -37,26 +38,27 @@ class KeyState:
 class GeminiProvider(BaseLLMProvider):
     """LLM provider using Google Generative AI REST API with key rotation."""
 
-    def __init__(self) -> None:
+    def __init__(self, session: aiohttp.ClientSession | None = None) -> None:
         settings = get_settings()
         self._keys: list[KeyState] = [
             KeyState(key=k) for k in settings.gemini_api_keys
         ]
         self._current_index: int = 0
         self._lock = asyncio.Lock()
+        self._session = session
 
     def _get_next_key(self) -> KeyState | None:
         """Select the next healthy key using round-robin.
 
-        Re-checks rate_limited keys if their cooldown has expired.
+        Re-checks rate_limited and error keys if their cooldown has expired.
         """
         now = time.time()
         num_keys = len(self._keys)
 
         # First pass: re-enable keys whose cooldown expired
         for key_state in self._keys:
-            if key_state.status == KeyStatus.RATE_LIMITED:
-                if now - key_state.cooldown_until >= 0:
+            if key_state.status in (KeyStatus.RATE_LIMITED, KeyStatus.ERROR):
+                if now >= key_state.cooldown_until:
                     key_state.status = KeyStatus.HEALTHY
 
         # Round-robin among healthy keys
@@ -68,9 +70,9 @@ class GeminiProvider(BaseLLMProvider):
                 key_state.last_used = now
                 return key_state
 
-        # If no healthy keys, try rate_limited keys with expired cooldowns
+        # If no healthy keys, try keys with expired cooldowns
         for key_state in self._keys:
-            if key_state.status == KeyStatus.RATE_LIMITED:
+            if key_state.status in (KeyStatus.RATE_LIMITED, KeyStatus.ERROR):
                 if now >= key_state.cooldown_until:
                     key_state.status = KeyStatus.HEALTHY
                     key_state.last_used = now
@@ -84,8 +86,9 @@ class GeminiProvider(BaseLLMProvider):
         key_state.cooldown_until = time.time() + RATE_LIMIT_COOLDOWN
 
     def _mark_error(self, key_state: KeyState) -> None:
-        """Mark a key as having an error."""
+        """Mark a key as having an error with a longer cooldown."""
         key_state.status = KeyStatus.ERROR
+        key_state.cooldown_until = time.time() + ERROR_COOLDOWN
 
     async def generate(
         self,
@@ -107,14 +110,20 @@ class GeminiProvider(BaseLLMProvider):
 
         payload: dict[str, Any] = {"contents": contents}
 
-        # Add tools if provided, or add google_search for grounding
-        gemini_tools = self._build_tools(tools)
+        # Add google_search tool for grounding (ignore passed-in tools
+        # since Gemini uses its native google_search instead)
+        gemini_tools = self._build_tools()
         if gemini_tools:
             payload["tools"] = gemini_tools
 
         try:
-            timeout = aiohttp.ClientTimeout(total=TIMEOUT_SECONDS)
-            async with aiohttp.ClientSession(timeout=timeout) as session:
+            session = self._session
+            owns_session = session is None
+            if owns_session:
+                timeout = aiohttp.ClientTimeout(total=TIMEOUT_SECONDS)
+                session = aiohttp.ClientSession(timeout=timeout)
+
+            try:
                 async with session.post(
                     url,
                     params=params,
@@ -142,20 +151,47 @@ class GeminiProvider(BaseLLMProvider):
                     raise RuntimeError(
                         f"Gemini API error: {resp.status} {error_text}"
                     )
+            finally:
+                if owns_session:
+                    await session.close()
 
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
             self._mark_rate_limited(key_state)
             raise RuntimeError(f"Gemini API request failed: {e}") from e
 
     def _convert_messages(self, messages: list[dict]) -> list[dict]:
-        """Convert OpenAI-style messages to Gemini format."""
-        contents = []
+        """Convert OpenAI-style messages to Gemini format.
+
+        System messages are merged into the first user message to avoid
+        consecutive same-role messages that Gemini rejects.
+        """
+        # Separate system content from other messages
+        system_parts: list[str] = []
+        non_system: list[dict] = []
         for msg in messages:
+            if msg["role"] == "system":
+                system_parts.append(msg["content"])
+            else:
+                non_system.append(msg)
+
+        # If there's system content, prepend it to the first user message
+        if system_parts and non_system:
+            system_text = "\n".join(system_parts)
+            for i, msg in enumerate(non_system):
+                if msg["role"] == "user":
+                    non_system[i] = {
+                        "role": "user",
+                        "content": system_text + "\n" + msg["content"],
+                    }
+                    break
+            else:
+                # No user message found; prepend as a user message
+                non_system.insert(0, {"role": "user", "content": system_text})
+
+        contents = []
+        for msg in non_system:
             role = msg["role"]
-            # Map roles: system -> user (Gemini doesn't have system role in contents)
-            if role == "system":
-                role = "user"
-            elif role == "assistant":
+            if role == "assistant":
                 role = "model"
 
             contents.append({
@@ -164,33 +200,9 @@ class GeminiProvider(BaseLLMProvider):
             })
         return contents
 
-    def _build_tools(self, tools: list[dict] | None) -> list[dict]:
-        """Build Gemini tools list, including google_search for grounding."""
-        gemini_tools = []
-
-        # Always include google_search for grounding
-        gemini_tools.append({"google_search": {}})
-
-        if tools:
-            # Convert OpenAI-style function tools to Gemini format
-            function_declarations = []
-            for tool in tools:
-                if tool.get("type") == "function":
-                    func = tool["function"]
-                    declaration = {
-                        "name": func["name"],
-                        "description": func.get("description", ""),
-                    }
-                    if "parameters" in func:
-                        declaration["parameters"] = func["parameters"]
-                    function_declarations.append(declaration)
-
-            if function_declarations:
-                gemini_tools.append(
-                    {"function_declarations": function_declarations}
-                )
-
-        return gemini_tools
+    def _build_tools(self) -> list[dict]:
+        """Build Gemini tools list with only the native google_search for grounding."""
+        return [{"google_search": {}}]
 
     def _extract_response(self, data: dict) -> str:
         """Extract text from Gemini API response."""

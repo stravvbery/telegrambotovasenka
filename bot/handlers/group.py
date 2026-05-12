@@ -1,4 +1,6 @@
+import json
 import logging
+import re
 
 from aiogram import Bot, Router
 from aiogram.enums import ChatAction
@@ -8,7 +10,7 @@ from bot.config import get_settings
 from bot.models import AVAILABLE_MODELS
 from bot.providers.router import ProviderRouter
 from bot.search.manager import SearchManager
-from bot.tools import enhance_with_search, get_search_tool_schema
+from bot.tools import ToolExecutor, enhance_with_search, get_search_tool_schema
 
 logger = logging.getLogger(__name__)
 
@@ -69,9 +71,27 @@ async def handle_group_message(message: Message, bot: Bot) -> None:
         provider = provider_router.get_provider(model_id)
         actual_model_id = provider_router.get_model_id(model_id)
 
-        if model_info.supports_tools:
+        if model_info.supports_tools and model_info.provider == "google":
+            # Gemini uses native google_search - no need to pass tool schema
+            response_text = await provider.generate(messages, actual_model_id)
+        elif model_info.supports_tools:
+            # Fireworks models: pass tool schema and handle tool calls
             tools = [get_search_tool_schema()]
             response_text = await provider.generate(messages, actual_model_id, tools=tools)
+
+            # Check if response contains tool calls (for Fireworks format)
+            if "[Tool call: web_search(" in response_text:
+                tool_calls = _parse_tool_calls(response_text)
+                if tool_calls:
+                    tool_executor = ToolExecutor(search_manager)
+                    tool_results = await tool_executor.execute_tool_calls(tool_calls)
+
+                    # Append assistant tool-call message and tool results
+                    messages.append({"role": "assistant", "content": response_text})
+                    messages.extend(tool_results)
+
+                    # Call the LLM again with tool results
+                    response_text = await provider.generate(messages, actual_model_id, tools=tools)
         else:
             search_context = await enhance_with_search(query, search_manager)
             if search_context:
@@ -97,3 +117,28 @@ async def _send_long_reply(message: Message, text: str) -> None:
         chunk = text[:max_len]
         text = text[max_len:]
         await message.reply(chunk)
+
+
+def _parse_tool_calls(response_text: str) -> list[dict]:
+    """Parse tool calls from Fireworks-formatted response text.
+
+    Expects format: [Tool call: web_search({"query": "..."})]
+    """
+    tool_calls = []
+    pattern = r'\[Tool call: (\w+)\(({.*?})\)\]'
+    matches = re.finditer(pattern, response_text, re.DOTALL)
+    for i, match in enumerate(matches):
+        name = match.group(1)
+        args_str = match.group(2)
+        try:
+            args = json.loads(args_str)
+        except json.JSONDecodeError:
+            args = {}
+        tool_calls.append({
+            "id": f"call_{i}",
+            "function": {
+                "name": name,
+                "arguments": json.dumps(args),
+            },
+        })
+    return tool_calls

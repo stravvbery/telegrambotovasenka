@@ -26,21 +26,21 @@ async def main() -> None:
 
     # Initialize shared resources
     search_manager = SearchManager(settings)
-    provider_router = ProviderRouter()
-
-    # Store shared resources in bot context
-    bot["search_manager"] = search_manager
-    bot["provider_router"] = provider_router
 
     # Register routers
     dp.include_router(dm_router)
     dp.include_router(group_router)
     dp.include_router(inline_router)
 
-    # Startup hook - create aiohttp session
+    # Startup hook - create aiohttp session and initialize providers
     @dp.startup()
     async def on_startup() -> None:
-        bot["session"] = aiohttp.ClientSession()
+        session = aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=60)
+        )
+        bot["session"] = session
+        bot["search_manager"] = search_manager
+        bot["provider_router"] = ProviderRouter(session=session)
         logger.info("Bot started")
 
     # Shutdown hook - close aiohttp session

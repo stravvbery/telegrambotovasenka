@@ -18,8 +18,9 @@ TIMEOUT_SECONDS = 60
 class FireworksProvider(BaseLLMProvider):
     """LLM provider using the Fireworks AI OpenAI-compatible API."""
 
-    def __init__(self) -> None:
+    def __init__(self, session: aiohttp.ClientSession | None = None) -> None:
         self._api_key = get_settings().fireworks_api_key
+        self._session = session
 
     async def generate(
         self,
@@ -42,8 +43,13 @@ class FireworksProvider(BaseLLMProvider):
 
         for attempt in range(MAX_RETRIES):
             try:
-                timeout = aiohttp.ClientTimeout(total=TIMEOUT_SECONDS)
-                async with aiohttp.ClientSession(timeout=timeout) as session:
+                session = self._session
+                owns_session = session is None
+                if owns_session:
+                    timeout = aiohttp.ClientTimeout(total=TIMEOUT_SECONDS)
+                    session = aiohttp.ClientSession(timeout=timeout)
+
+                try:
                     async with session.post(
                         FIREWORKS_API_URL,
                         headers=headers,
@@ -70,6 +76,9 @@ class FireworksProvider(BaseLLMProvider):
                         raise RuntimeError(
                             f"Fireworks API error: {resp.status} {error_text}"
                         )
+                finally:
+                    if owns_session:
+                        await session.close()
 
             except (aiohttp.ClientError, asyncio.TimeoutError) as e:
                 logger.warning(

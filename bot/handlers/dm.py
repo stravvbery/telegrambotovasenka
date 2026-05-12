@@ -1,4 +1,6 @@
+import json
 import logging
+import re
 
 from aiogram import Bot, F, Router
 from aiogram.enums import ChatAction, ParseMode
@@ -138,17 +140,28 @@ async def handle_dm_message(message: Message, bot: Bot) -> None:
         provider = provider_router.get_provider(model_id)
         actual_model_id = provider_router.get_model_id(model_id)
 
-        if model_info.supports_tools:
-            # Model supports tools - pass tool schema
+        if model_info.supports_tools and model_info.provider == "google":
+            # Gemini uses native google_search - no need to pass tool schema
+            response_text = await provider.generate(messages, actual_model_id)
+        elif model_info.supports_tools:
+            # Fireworks models: pass tool schema and handle tool calls
             tools = [get_search_tool_schema()]
             response_text = await provider.generate(messages, actual_model_id, tools=tools)
 
             # Check if response contains tool calls (for Fireworks format)
             if "[Tool call: web_search(" in response_text:
-                # Parse and execute tool calls, then call again
-                # For simplicity with the current provider architecture,
-                # the tool call is already formatted in the response
-                pass
+                # Parse tool calls from the formatted response
+                tool_calls = _parse_tool_calls(response_text)
+                if tool_calls:
+                    tool_executor = ToolExecutor(search_manager)
+                    tool_results = await tool_executor.execute_tool_calls(tool_calls)
+
+                    # Append the assistant tool-call message and tool results
+                    messages.append({"role": "assistant", "content": response_text})
+                    messages.extend(tool_results)
+
+                    # Call the LLM again with tool results
+                    response_text = await provider.generate(messages, actual_model_id, tools=tools)
         else:
             # Model doesn't support tools - use search enhancement
             search_context = await enhance_with_search(user_text, search_manager)
@@ -165,6 +178,31 @@ async def handle_dm_message(message: Message, bot: Bot) -> None:
     except Exception as e:
         logger.exception("Error processing DM: %s", e)
         await message.answer("Sorry, an error occurred. Please try again.")
+
+
+def _parse_tool_calls(response_text: str) -> list[dict]:
+    """Parse tool calls from Fireworks-formatted response text.
+
+    Expects format: [Tool call: web_search({"query": "..."})]
+    """
+    tool_calls = []
+    pattern = r'\[Tool call: (\w+)\(({.*?})\)\]'
+    matches = re.finditer(pattern, response_text, re.DOTALL)
+    for i, match in enumerate(matches):
+        name = match.group(1)
+        args_str = match.group(2)
+        try:
+            args = json.loads(args_str)
+        except json.JSONDecodeError:
+            args = {}
+        tool_calls.append({
+            "id": f"call_{i}",
+            "function": {
+                "name": name,
+                "arguments": json.dumps(args),
+            },
+        })
+    return tool_calls
 
 
 async def _send_long_message(message: Message, text: str) -> None:

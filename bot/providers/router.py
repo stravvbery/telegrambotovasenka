@@ -3,13 +3,15 @@ from bot.providers import BaseLLMProvider
 from bot.providers.fireworks import FireworksProvider
 from bot.providers.gemini import GeminiProvider
 
+import aiohttp
+
 
 class ProviderRouter:
     """Routes model requests to the appropriate provider."""
 
-    def __init__(self) -> None:
-        self._fireworks = FireworksProvider()
-        self._gemini = GeminiProvider()
+    def __init__(self, session: aiohttp.ClientSession | None = None) -> None:
+        self._fireworks = FireworksProvider(session=session)
+        self._gemini = GeminiProvider(session=session)
         self._model_map: dict[str, ModelInfo] = {
             m.id: m for m in AVAILABLE_MODELS
         }
