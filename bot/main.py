@@ -3,7 +3,7 @@ import logging
 import aiohttp
 from aiogram import Bot, Dispatcher
 
-from bot.config import get_settings
+from bot.config import get_settings, validate_settings
 from bot.handlers.dm import router as dm_router
 from bot.handlers.group import router as group_router
 from bot.handlers.inline import router as inline_router
@@ -21,6 +21,7 @@ async def main() -> None:
     )
 
     settings = get_settings()
+    validate_settings(settings)
     bot = Bot(token=settings.bot_token)
     dp = Dispatcher()
 
